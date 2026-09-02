@@ -26,31 +26,51 @@ def init_db():
             triage TEXT,
             confidence REAL,
             gradcam_url TEXT,
+            model_variant TEXT DEFAULT 'integrated',
             timestamp TEXT
         )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_encounters_timestamp
+        ON encounters(timestamp DESC)
     """)
     conn.commit()
     conn.close()
 
 
 def save_encounter(worker_name: str, quality_result: dict, dr_class: str,
-                    triage: str, confidence: float, gradcam_url: str) -> str:
-    encounter_id = str(uuid.uuid4())[:8]
+                    triage: str, confidence: float, gradcam_url: str,
+                    model_variant: str = "integrated") -> str:
+    """
+    model_variant distinguishes which pipeline produced this prediction —
+    "integrated" (the full Clarus workflow) or "baseline" (a plain CNN
+    with none of the four added components), matching the Comparative
+    Evaluation Module described in Chapter 3. Both stubbed identically
+    for now until Person A's real models exist for each.
+    """
     timestamp = datetime.now(timezone.utc).isoformat()
-
     conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        """INSERT INTO encounters
-           (encounter_id, worker_name, quality_pass, quality_reason,
-            dr_class, triage, confidence, gradcam_url, timestamp)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (encounter_id, worker_name, int(quality_result["quality_pass"]),
-         quality_result.get("reason"), dr_class, triage, confidence,
-         gradcam_url, timestamp),
-    )
-    conn.commit()
+
+    for attempt in range(5):
+        encounter_id = str(uuid.uuid4())[:8]
+        try:
+            conn.execute(
+                """INSERT INTO encounters
+                   (encounter_id, worker_name, quality_pass, quality_reason,
+                    dr_class, triage, confidence, gradcam_url, model_variant, timestamp)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (encounter_id, worker_name, int(quality_result["quality_pass"]),
+                 quality_result.get("reason"), dr_class, triage, confidence,
+                 gradcam_url, model_variant, timestamp),
+            )
+            conn.commit()
+            conn.close()
+            return encounter_id
+        except sqlite3.IntegrityError:
+            continue
+
     conn.close()
-    return encounter_id
+    raise RuntimeError("Failed to generate a unique encounter_id after 5 attempts")
 
 
 def get_history(limit: int = 50) -> list[dict]:
