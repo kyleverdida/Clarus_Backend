@@ -8,39 +8,43 @@ tested end-to-end before Person A's trained model exists.
 *** HAND-OFF POINT WITH PERSON A ***
 When the real model is ready, replace the body of `classify_image()` with
 actual inference — but keep the function signature and return shape
-IDENTICAL, so nothing else in the backend needs to change. That's the
-whole point of isolating this into one function.
+IDENTICAL, so nothing else in the backend needs to change.
 
-Expected real implementation will likely:
-  1. Load the trained model once at startup (not per-request — too slow)
-  2. Preprocess the image (resize, normalize) to match training preprocessing
-  3. Run inference, get class probabilities
-  4. Return the predicted class + confidence in this same dict shape
+Supports two variants for the Comparative Evaluation Module (Chapter 3):
+  - "integrated": the full Clarus model, trained WITH class-imbalance
+    handling (focal loss / targeted augmentation per Objective 3)
+  - "baseline": a conventional CNN, trained WITHOUT imbalance handling —
+    this is the comparison point for Objective 4
+
+Right now both variants call the same stub logic and will look identical
+in output. Once Person A has two actual trained model files (one per
+variant), each branch below should load and run its own model instead of
+sharing this stub.
 """
 
 import random
 
-# These must match whatever classes Person A's model is actually trained on.
-# Standard 5-class ICDR DR severity scale — confirm this matches their
-# training labels exactly before wiring in the real model.
 DR_CLASSES = ["No_DR", "Mild", "Moderate", "Severe", "Proliferative_DR"]
 
 
-def classify_image(image_bytes: bytes) -> dict:
+def classify_image(image_bytes: bytes, variant: str = "integrated") -> dict:
     """
-    Takes raw image bytes (already passed quality gating), returns the
-    underlying DR severity classification and confidence.
+    Takes raw image bytes (already passed quality gating) plus which
+    model variant to use, returns the underlying DR severity
+    classification and confidence for that variant.
 
-    STUB: picks a weighted-random class to simulate realistic class
-    imbalance (mostly No_DR / Mild, occasionally Severe) rather than
-    uniform randomness, so the rest of the app can be tested against
-    a realistic-feeling distribution.
+    variant: "integrated" or "baseline" — see module docstring.
     """
-    weights = [0.5, 0.25, 0.15, 0.07, 0.03]  # rough imbalance simulation
+    if variant == "baseline":
+        weights = [0.7, 0.15, 0.08, 0.05, 0.02]
+    else:
+        weights = [0.5, 0.25, 0.15, 0.07, 0.03]
+
     predicted_class = random.choices(DR_CLASSES, weights=weights, k=1)[0]
     confidence = round(random.uniform(0.72, 0.97), 4)
 
     return {
         "dr_class": predicted_class,
         "confidence": confidence,
+        "variant": variant,
     }

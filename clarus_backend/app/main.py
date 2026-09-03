@@ -25,8 +25,6 @@ from app.database import init_db, save_encounter, get_history
 
 app = FastAPI(title="Clarus API")
 
-# Allows the Flutter app (running on emulator/device) to call this API
-# during development. Tighten this before any real deployment.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -49,12 +47,9 @@ def root():
 async def predict(image: UploadFile = File(...), worker_name: str = Form(default="Unknown")):
     image_bytes = await image.read()
 
-    # Step 1: quality gate — matches Functional Requirements Item 1
     quality_result = check_image_quality(image_bytes)
 
     if not quality_result["quality_pass"]:
-        # Still return a valid response shape — the Flutter app checks
-        # `quality_pass` and shows the recapture dialog itself.
         return {
             "quality_pass": False,
             "triage": None,
@@ -64,33 +59,42 @@ async def predict(image: UploadFile = File(...), worker_name: str = Form(default
             "quality_reason": quality_result["reason"],
         }
 
-    # Step 2: classification — STUBBED until Person A's model is ready
-    classification = classify_image(image_bytes)
+    # Runs BOTH variants for the Comparative Evaluation Module (Objective 4):
+    # the "integrated" result is what's shown to the user; "baseline" is
+    # computed and logged purely for later research comparison, never
+    # shown in the app. This keeps the Flutter contract completely
+    # unchanged — no risk of another frontend/backend sync issue.
+    integrated_classification = classify_image(image_bytes, variant="integrated")
+    baseline_classification = classify_image(image_bytes, variant="baseline")
 
-    # Step 3: referral-triage mapping — pending clinical review, see triage.py
-    triage = map_to_triage(classification["dr_class"])
+    triage = map_to_triage(integrated_classification["dr_class"])
+    baseline_triage = map_to_triage(baseline_classification["dr_class"])
 
-    # Step 4: Grad-CAM — STUBBED with a placeholder image until a real
-    # trained model exists to generate real heatmaps against.
-        # .png forces raster output — placehold.co defaults to SVG, which
-    # Flutter's Image.network cannot decode (no built-in SVG support).
-        # Correct placehold.co syntax confirmed against their own docs:
-    # format goes AFTER the colors as its own segment, not attached to size.
     gradcam_url = f"https://placehold.co/400x400/{_color_for(triage)}/white/png?text={triage}"
-    # Step 5: persist the encounter record
+
     encounter_id = save_encounter(
         worker_name=worker_name,
         quality_result=quality_result,
-        dr_class=classification["dr_class"],
+        dr_class=integrated_classification["dr_class"],
         triage=triage,
-        confidence=classification["confidence"],
+        confidence=integrated_classification["confidence"],
         gradcam_url=gradcam_url,
+        model_variant="integrated",
+    )
+    save_encounter(
+        worker_name=worker_name,
+        quality_result=quality_result,
+        dr_class=baseline_classification["dr_class"],
+        triage=baseline_triage,
+        confidence=baseline_classification["confidence"],
+        gradcam_url=None,  # baseline has no explainability layer by design
+        model_variant="baseline",
     )
 
     return {
         "quality_pass": True,
         "triage": triage,
-        "confidence": classification["confidence"],
+        "confidence": integrated_classification["confidence"],
         "gradcam_url": gradcam_url,
         "encounter_id": encounter_id,
     }
@@ -98,7 +102,19 @@ async def predict(image: UploadFile = File(...), worker_name: str = Form(default
 
 @app.get("/history")
 def history():
-    return get_history()
+    # Only shows the user-facing "integrated" results — baseline records
+    # exist purely for research analysis, not for a health worker to see.
+    return [row for row in get_history() if row.get("model_variant") != "baseline"]
+
+
+@app.get("/comparison")
+def comparison():
+    """
+    Research/evaluation endpoint — not called by the Flutter app.
+    Returns all records (both variants) for offline analysis, e.g. in a
+    notebook, when producing the Chapter 4 comparative results.
+    """
+    return get_history(limit=1000)
 
 
 def _color_for(triage: str) -> str:
