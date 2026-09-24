@@ -20,7 +20,7 @@ pip install -r requirements.txt
 ## Run it
 
 ```
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 FastAPI provides interactive API documentation at
@@ -34,6 +34,7 @@ Accepts `multipart/form-data` with:
 
 - `image`: the retinal image file
 - `worker_name`: optional health-worker name; defaults to `Unknown`
+- `patient_id`: patient name entered by the health worker; defaults to `Unknown`
 
 Successful response:
 
@@ -55,12 +56,35 @@ rejected image is not saved as an encounter.
 ### `GET /history`
 
 Returns the user-facing integrated screening history. Baseline comparison
-records are excluded from this response.
+records are excluded from this response. Each entry includes `patient_id`,
+when it was recorded for the encounter. Records created before patient-name
+capture was added may have a null patient ID.
 
 ### `GET /comparison`
 
 Returns integrated and baseline records for research and evaluation. This is
 not used by `Clarus_App`.
+
+### Follow-up plans
+
+`POST /follow-ups` creates a consented follow-up plan for a patient. The JSON
+body accepts `patient_id`, optional `encounter_id`, `contact_method` (`SMS` or
+`Email`), `contact_value`, `consent_given`, and a clinician-selected
+`return_date` in `YYYY-MM-DD` format. If an encounter ID is supplied, it must
+belong to an integrated `Monitor` encounter.
+
+`GET /follow-ups` returns saved plans for the monitoring list. Use
+`PATCH /follow-ups/{follow_up_id}` to change the `status` (`scheduled`,
+`completed`, `rescheduled`, or `missed`) or update the `return_date`.
+
+Scheduled plans whose return date has passed are returned with status
+`overdue` automatically. The API rejects new or rescheduled dates in the
+past. Follow-up records include the patient name and can optionally link to
+an integrated Monitor encounter through `encounter_id`.
+
+These endpoints persist plans and statuses in SQLite. SMS/email delivery is
+not enabled yet; delivery should be added after the clinic confirms the
+workflow and consent process.
 
 ### `GET /`
 
@@ -78,13 +102,14 @@ Returns a simple health response: `{ "status": "Clarus API running" }`.
 
 ## Connecting `Clarus_App`
 
-1. Start this backend with `uvicorn app.main:app --host 0.0.0.0 --port 8000`.
+1. Start this backend with `python -m uvicorn app.main:app --host 0.0.0.0 --port 8000`.
 2. In `Clarus_App/lib/services/api_service.dart`, set `useMockApi = false`.
 3. Use `http://10.0.2.2:8000` as the base URL on an Android emulator. Use
 	`http://127.0.0.1:8000` for a Flutter desktop or web client running on the
 	same computer.
-4. Submit the image as the `image` multipart field. The response fields match
-	the screening result model used by `Clarus_App`.
+4. Submit the image as the `image` multipart field and the patient name as the
+	`patient_id` multipart field. The response fields match the screening
+	result model used by `Clarus_App`.
 
 For a physical device, replace the host with the computer's local network IP
 and make sure the device and computer are on the same network.
@@ -107,6 +132,8 @@ how the prediction was made.
 Good image   -> 200 OK, quality_pass: true, triage assigned
 Blurry image -> 200 OK, quality_pass: false, reason: "blurry"
 History      -> returns integrated user-facing encounters only
+Patient name -> stored with new encounters and returned by `/history`
+Overdue plan -> scheduled plan past its return date is returned as `overdue`
 ```
 
 The `/comparison` endpoint includes both model variants. Each accepted image
