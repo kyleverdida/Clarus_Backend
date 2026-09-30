@@ -25,6 +25,9 @@ def init_db():
             dr_class TEXT,
             triage TEXT,
             confidence REAL,
+            triage_confidence REAL,
+            severity TEXT,
+            severity_confidence REAL,
             gradcam_url TEXT,
             patient_id TEXT,
             model_variant TEXT DEFAULT 'integrated',
@@ -36,6 +39,12 @@ def init_db():
     }
     if "patient_id" not in columns:
         conn.execute("ALTER TABLE encounters ADD COLUMN patient_id TEXT")
+    if "triage_confidence" not in columns:
+        conn.execute("ALTER TABLE encounters ADD COLUMN triage_confidence REAL")
+    if "severity" not in columns:
+        conn.execute("ALTER TABLE encounters ADD COLUMN severity TEXT")
+    if "severity_confidence" not in columns:
+        conn.execute("ALTER TABLE encounters ADD COLUMN severity_confidence REAL")
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_encounters_timestamp
         ON encounters(timestamp DESC)
@@ -68,6 +77,9 @@ def init_db():
 
 def save_encounter(worker_name: str, quality_result: dict, dr_class: str,
                     triage: str, confidence: float, gradcam_url: str,
+                    triage_confidence: float | None = None,
+                    severity: str | None = None,
+                    severity_confidence: float | None = None,
                     model_variant: str = "integrated",
                     patient_id: str | None = None) -> str:
     """
@@ -86,12 +98,14 @@ def save_encounter(worker_name: str, quality_result: dict, dr_class: str,
             conn.execute(
                 """INSERT INTO encounters
                    (encounter_id, worker_name, quality_pass, quality_reason,
-                                        dr_class, triage, confidence, gradcam_url, patient_id,
+                                                     dr_class, triage, confidence, triage_confidence,
+                                                     severity, severity_confidence, gradcam_url, patient_id,
                                         model_variant, timestamp)
-                                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (encounter_id, worker_name, int(quality_result["quality_pass"]),
-                 quality_result.get("reason"), dr_class, triage, confidence,
-                                 gradcam_url, patient_id, model_variant, timestamp),
+                      quality_result.get("reason"), dr_class, triage, confidence,
+                      triage_confidence, severity, severity_confidence, gradcam_url,
+                      patient_id, model_variant, timestamp),
             )
             conn.commit()
             conn.close()

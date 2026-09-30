@@ -43,15 +43,26 @@ Successful response:
 	"quality_pass": true,
 	"triage": "Normal",
 	"confidence": 0.91,
+	"triage_confidence": 0.91,
+	"severity": "No_DR",
+	"severity_confidence": 0.91,
 	"gradcam_url": "https://placehold.co/400x400/...",
 	"encounter_id": "a1b2c3d4"
 }
 ```
 
+The response includes the action triage, the underlying diabetic-retinopathy
+severity, and separate confidence values for each:
+
 If the image fails quality checks, the response is still `200 OK` and has
 `quality_pass: false`, `triage: null`, `confidence: 0.0`,
+`triage_confidence: null`, `severity: null`, `severity_confidence: null`,
 `gradcam_url: null`, `encounter_id: null`, and a `quality_reason` field. The
 rejected image is not saved as an encounter.
+`triage_confidence` describes confidence in the Normal/Monitor/Refer action.
+`severity` and `severity_confidence` describe the underlying DR classifier
+output. The triage mapping is a proposed clinical design and requires review;
+the app must not infer severity from triage alone.
 
 ### `GET /history`
 
