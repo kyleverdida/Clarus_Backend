@@ -79,8 +79,8 @@ not used by `Clarus_App`.
 ### Follow-up plans
 
 `POST /follow-ups` creates a consented follow-up plan for a patient. The JSON
-body accepts `patient_id`, optional `encounter_id`, `contact_method` (`SMS` or
-`Email`), `contact_value`, `consent_given`, and a clinician-selected
+body accepts `patient_id`, optional `encounter_id`, `contact_method` (`Email`),
+`contact_value`, `consent_given`, and a clinician-selected
 `return_date` in `YYYY-MM-DD` format. If an encounter ID is supplied, it must
 belong to an integrated `Monitor` encounter.
 
@@ -93,9 +93,31 @@ Scheduled plans whose return date has passed are returned with status
 past. Follow-up records include the patient name and can optionally link to
 an integrated Monitor encounter through `encounter_id`.
 
-These endpoints persist plans and statuses in SQLite. SMS/email delivery is
-not enabled yet; delivery should be added after the clinic confirms the
-workflow and consent process.
+These endpoints persist plans and statuses in SQLite. Email reminders use
+Gmail SMTP and require the following environment variables before starting
+the server:
+
+```powershell
+$env:CLARUS_EMAIL_USER = "your-email@gmail.com"
+$env:CLARUS_EMAIL_APP_PASSWORD = "your-gmail-app-password"
+```
+
+The system checks for reminders once every 24 hours. The first reminder is
+due seven days before the return date, and the second is due on the return
+date if the patient has not returned. To trigger the check manually, use
+`POST /reminders/send`. The response reports the number checked, sent, and
+failed:
+
+```json
+{
+	"checked": 1,
+	"sent": 1,
+	"failed": 0
+}
+```
+
+For testing, use your own email address and a Gmail App Password. Never
+commit the App Password to the repository.
 
 ### `GET /`
 
@@ -145,6 +167,7 @@ Blurry image -> 200 OK, quality_pass: false, reason: "blurry"
 History      -> returns integrated user-facing encounters only
 Patient name -> stored with new encounters and returned by `/history`
 Overdue plan -> scheduled plan past its return date is returned as `overdue`
+Email reminders -> two-stage cadence is tracked with `reminder_count`
 ```
 
 The `/comparison` endpoint includes both model variants. Each accepted image

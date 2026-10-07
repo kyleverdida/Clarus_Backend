@@ -63,6 +63,19 @@ def init_db():
             updated_at TEXT NOT NULL
         )
     """)
+    follow_up_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(follow_up_plans)")
+    }
+    if "reminder_count" not in follow_up_columns:
+        conn.execute(
+            "ALTER TABLE follow_up_plans "
+            "ADD COLUMN reminder_count INTEGER DEFAULT 0"
+        )
+    if "last_reminder_sent_at" not in follow_up_columns:
+        conn.execute(
+            "ALTER TABLE follow_up_plans "
+            "ADD COLUMN last_reminder_sent_at TEXT"
+        )
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_follow_up_return_date
         ON follow_up_plans(return_date)
@@ -188,6 +201,48 @@ def get_follow_up_plan(follow_up_id: str) -> dict | None:
     ).fetchone()
     conn.close()
     return _follow_up_dict(row) if row else None
+
+
+def get_due_email_reminders() -> list[dict]:
+    """
+    Return scheduled, consented email plans due for one of two reminders.
+
+    The first reminder is due seven days before the return date. The second
+    reminder is due on the return date if the patient has not returned.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        """SELECT * FROM follow_up_plans
+           WHERE contact_method = 'Email'
+             AND consent_given = 1
+             AND status = 'scheduled'
+             AND (
+                 (
+                     reminder_count = 0
+                     AND date(return_date, '-7 days') <= date('now')
+                 )
+                 OR (
+                     reminder_count = 1
+                     AND return_date <= date('now')
+                 )
+             )"""
+    ).fetchall()
+    conn.close()
+    return [_follow_up_dict(row) for row in rows]
+
+
+def record_reminder_sent(follow_up_id: str) -> None:
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """UPDATE follow_up_plans
+           SET reminder_count = reminder_count + 1,
+               last_reminder_sent_at = ?
+           WHERE follow_up_id = ?""",
+        (datetime.now(timezone.utc).isoformat(), follow_up_id),
+    )
+    conn.commit()
+    conn.close()
 
 
 def _follow_up_dict(row: sqlite3.Row) -> dict:

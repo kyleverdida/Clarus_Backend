@@ -18,24 +18,29 @@ Run locally with:
 from datetime import date
 from typing import Literal
 
+from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from app.email_service import send_followup_reminder
 from app.quality import check_image_quality
 from app.classifier import classify_image
 from app.triage import map_to_triage
 from app.database import (
     encounter_is_monitor,
+    get_due_email_reminders,
     get_follow_up_plans,
     get_history,
     init_db,
+    record_reminder_sent,
     save_encounter,
     save_follow_up_plan,
     update_follow_up_plan,
 )
 
 app = FastAPI(title="Clarus API")
+scheduler = BackgroundScheduler(timezone="UTC")
 
 app.add_middleware(
     CORSMiddleware,
@@ -45,7 +50,7 @@ app.add_middleware(
 )
 
 
-ContactMethod = Literal["SMS", "Email"]
+ContactMethod = Literal["Email"]
 FollowUpStatus = Literal["scheduled", "completed", "rescheduled", "missed"]
 
 
@@ -66,6 +71,20 @@ class FollowUpUpdate(BaseModel):
 @app.on_event("startup")
 def on_startup():
     init_db()
+    scheduler.add_job(
+        send_due_reminders,
+        "interval",
+        hours=24,
+        id="daily_due_reminders",
+        replace_existing=True,
+    )
+    scheduler.start()
+
+
+@app.on_event("shutdown")
+def on_shutdown():
+    if scheduler.running:
+        scheduler.shutdown(wait=False)
 
 
 @app.get("/")
@@ -196,6 +215,27 @@ def create_follow_up(plan: FollowUpCreate):
 @app.get("/follow-ups")
 def follow_ups():
     return get_follow_up_plans()
+
+
+def send_due_reminders() -> dict:
+    due = get_due_email_reminders()
+    sent, failed = 0, 0
+    for plan in due:
+        success = send_followup_reminder(
+            plan["contact_value"], plan["return_date"]
+        )
+        if success:
+            record_reminder_sent(plan["follow_up_id"])
+            sent += 1
+        else:
+            failed += 1
+    return {"checked": len(due), "sent": sent, "failed": failed}
+
+
+@app.post("/reminders/send")
+def trigger_reminders():
+    """Manually trigger the reminder check for testing and demonstrations."""
+    return send_due_reminders()
 
 
 @app.patch("/follow-ups/{follow_up_id}")

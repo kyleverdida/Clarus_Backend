@@ -1,5 +1,6 @@
 fastapi
 uvicorn[standard]
+APScheduler>=3.10,<4
 python-multipart
 opencv-python-headless
 numpy
