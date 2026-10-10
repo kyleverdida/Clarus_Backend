@@ -4,3 +4,7 @@ APScheduler>=3.10,<4
 python-multipart
 opencv-python-headless
 numpy
+
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
