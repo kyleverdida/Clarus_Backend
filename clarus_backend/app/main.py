@@ -21,9 +21,9 @@ from typing import Literal
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, EmailStr, Field
 
-from app.email_service import send_followup_reminder
+from app.email_service import GmailAuthError, send_followup_reminder
 from app.quality import check_image_quality
 from app.classifier import classify_image
 from app.triage import map_to_triage
@@ -40,7 +40,7 @@ from app.database import (
 )
 
 app = FastAPI(title="Clarus API")
-scheduler = BackgroundScheduler(timezone="UTC")
+scheduler = BackgroundScheduler(timezone="Asia/Manila")
 
 app.add_middleware(
     CORSMiddleware,
@@ -58,7 +58,7 @@ class FollowUpCreate(BaseModel):
     patient_id: str = Field(min_length=1, max_length=120)
     encounter_id: str | None = Field(default=None, max_length=120)
     contact_method: ContactMethod
-    contact_value: str = Field(min_length=3, max_length=160)
+    contact_value: EmailStr  # reminders are email-only; reject anything else
     consent_given: bool
     return_date: date
 
@@ -73,10 +73,12 @@ def on_startup():
     init_db()
     scheduler.add_job(
         send_due_reminders,
-        "interval",
-        hours=24,
+        "cron",
+        hour=9,
+        minute=0,
         id="daily_due_reminders",
         replace_existing=True,
+        misfire_grace_time=3600,  # still run if the server was down at 9:00
     )
     scheduler.start()
 
@@ -221,9 +223,19 @@ def send_due_reminders() -> dict:
     due = get_due_email_reminders()
     sent, failed = 0, 0
     for plan in due:
-        success = send_followup_reminder(
-            plan["contact_value"], plan["return_date"]
-        )
+        try:
+            success = send_followup_reminder(
+                plan["contact_value"], plan["return_date"]
+            )
+        except GmailAuthError as exc:
+            # Gmail itself is unusable; every remaining send would fail too.
+            print(f"[reminders] {exc}")
+            return {
+                "checked": len(due),
+                "sent": sent,
+                "failed": len(due) - sent,
+                "error": str(exc),
+            }
         if success:
             record_reminder_sent(plan["follow_up_id"])
             sent += 1

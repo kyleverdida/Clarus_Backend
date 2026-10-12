@@ -9,13 +9,25 @@ for a screening tool that isn't handling concurrent hospital-wide traffic.
 
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 DB_PATH = "clarus.db"
 
+# The Philippines is UTC+8 with no daylight saving, so a fixed offset is
+# exact and needs no timezone database.
+PH_TZ = timezone(timedelta(hours=8))
+
+
+def _connect() -> sqlite3.Connection:
+    # timeout: wait up to 10 s on a locked database instead of failing at
+    # once (the reminder job and API requests can write at the same time).
+    return sqlite3.connect(DB_PATH, timeout=10)
+
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
+    # WAL lets reads and writes proceed concurrently (persists in the file).
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS encounters (
             encounter_id TEXT PRIMARY KEY,
@@ -103,7 +115,7 @@ def save_encounter(worker_name: str, quality_result: dict, dr_class: str,
     for now until Person A's real models exist for each.
     """
     timestamp = datetime.now(timezone.utc).isoformat()
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
 
     for attempt in range(5):
         encounter_id = str(uuid.uuid4())[:8]
@@ -131,7 +143,7 @@ def save_encounter(worker_name: str, quality_result: dict, dr_class: str,
 
 
 def get_history(limit: int = 50) -> list[dict]:
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
         "SELECT * FROM encounters ORDER BY timestamp DESC LIMIT ?", (limit,)
@@ -141,7 +153,7 @@ def get_history(limit: int = 50) -> list[dict]:
 
 
 def encounter_is_monitor(encounter_id: str) -> bool:
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     row = conn.execute(
         """SELECT triage FROM encounters
            WHERE encounter_id = ? AND model_variant = 'integrated'""",
@@ -161,7 +173,7 @@ def save_follow_up_plan(
 ) -> dict:
     follow_up_id = str(uuid.uuid4())[:8]
     timestamp = datetime.now(timezone.utc).isoformat()
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     conn.execute(
         """INSERT INTO follow_up_plans
            (follow_up_id, encounter_id, patient_id, contact_method,
@@ -177,7 +189,7 @@ def save_follow_up_plan(
 
 
 def get_follow_up_plans() -> list[dict]:
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
         """SELECT * FROM follow_up_plans
@@ -193,7 +205,7 @@ def get_follow_up_plans() -> list[dict]:
 
 
 def get_follow_up_plan(follow_up_id: str) -> dict | None:
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     conn.row_factory = sqlite3.Row
     row = conn.execute(
         "SELECT * FROM follow_up_plans WHERE follow_up_id = ?",
@@ -209,8 +221,9 @@ def get_due_email_reminders() -> list[dict]:
 
     The first reminder is due seven days before the return date. The second
     reminder is due on the return date if the patient has not returned.
+    "Today" is the Philippine calendar date (UTC+8), not the UTC date.
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
         """SELECT * FROM follow_up_plans
@@ -220,11 +233,12 @@ def get_due_email_reminders() -> list[dict]:
              AND (
                  (
                      reminder_count = 0
-                     AND date(return_date, '-7 days') <= date('now')
+                     AND date(return_date, '-7 days')
+                         <= date('now', '+8 hours')
                  )
                  OR (
                      reminder_count = 1
-                     AND return_date <= date('now')
+                     AND return_date <= date('now', '+8 hours')
                  )
              )"""
     ).fetchall()
@@ -233,7 +247,7 @@ def get_due_email_reminders() -> list[dict]:
 
 
 def record_reminder_sent(follow_up_id: str) -> None:
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     conn.execute(
         """UPDATE follow_up_plans
            SET reminder_count = reminder_count + 1,
@@ -250,7 +264,7 @@ def _follow_up_dict(row: sqlite3.Row) -> dict:
     result["consent_given"] = bool(result["consent_given"])
     if (
         result["status"] == "scheduled"
-        and result["return_date"] < datetime.now(timezone.utc).date().isoformat()
+        and result["return_date"] < datetime.now(PH_TZ).date().isoformat()
     ):
         result["status"] = "overdue"
     return result
@@ -260,10 +274,15 @@ def update_follow_up_plan(follow_up_id: str, updates: dict) -> dict | None:
     if not updates:
         return get_follow_up_plan(follow_up_id)
 
+    if "return_date" in updates:
+        # A new date restarts the reminder cycle (7 days before, then on the day).
+        updates["reminder_count"] = 0
+        updates["last_reminder_sent_at"] = None
+
     updates["updated_at"] = datetime.now(timezone.utc).isoformat()
     assignments = ", ".join(f"{key} = ?" for key in updates)
     values = [*updates.values(), follow_up_id]
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     cursor = conn.execute(
         f"UPDATE follow_up_plans SET {assignments} WHERE follow_up_id = ?",
         values,
