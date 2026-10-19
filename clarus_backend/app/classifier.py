@@ -1,50 +1,77 @@
 """
-CNN classification module.
+CNN classification module - the REAL Clarus model (replaces the earlier random stub).
 
-STUB VERSION — returns plausible fake predictions so the rest of the
-pipeline (triage mapping, database, API, Flutter app) can be built and
-tested end-to-end before Person A's trained model exists.
+The trained package lives in <project>/model (the "For_App_Ready_Code_Of_CNN_Model" folder from the training notebook: clarus_core.py,
+clarus_final.json, the model folders). clarus_core.ClarusPredictor does everything for one image in a single pass - background removal,
+enhancement, BOTH networks, calibration, Grad-CAM - so the first call per image does the work and the second variant call of the same
+request is answered from a small cache.
 
-*** HAND-OFF POINT WITH PERSON A ***
-When the real model is ready, replace the body of `classify_image()` with
-actual inference — but keep the function signature and return shape
-IDENTICAL, so nothing else in the backend needs to change.
-
-Supports two variants for the Comparative Evaluation Module (Chapter 3):
-  - "integrated": the full Clarus model, trained WITH class-imbalance
-    handling (focal loss / targeted augmentation per Objective 3)
-  - "baseline": a conventional CNN, trained WITHOUT imbalance handling —
-    this is the comparison point for Objective 4
-
-Right now both variants call the same stub logic and will look identical
-in output. Once Person A has two actual trained model files (one per
-variant), each branch below should load and run its own model instead of
-sharing this stub.
+classify_image(image_bytes, variant) keeps the old name and the old keys (dr_class, confidence, variant) and adds the new ones.
+variant "integrated" = the model decision shown to the user (the notebook's FINAL choice); "baseline" = the Baseline CNN, logged for the study.
 """
-
-import random
+import hashlib
+import os
+import sys
+import threading
+from collections import OrderedDict
+from pathlib import Path
 
 DR_CLASSES = ["No_DR", "Mild", "Moderate", "Severe", "Proliferative_DR"]
+MODEL_DIR = Path(os.getenv("CLARUS_MODEL_DIR", Path(__file__).resolve().parent.parent / "model"))
+
+_predictor = None
+_load_lock = threading.Lock()
+_cache, _cache_lock = OrderedDict(), threading.Lock()
+
+
+def load_model():
+    """Load the networks ONCE (called at server start-up so the first request is not slow)."""
+    global _predictor
+    with _load_lock:
+        if _predictor is None:
+            if not (MODEL_DIR / "clarus_final.json").exists():
+                raise RuntimeError(f"Clarus model package not found in {MODEL_DIR}. Copy the 'For_App_Ready_Code_Of_CNN_Model' folder there "
+                                   "or set the CLARUS_MODEL_DIR environment variable.")
+            sys.path.insert(0, str(MODEL_DIR))
+            from clarus_core import ClarusPredictor
+            _predictor = ClarusPredictor.from_final(MODEL_DIR)
+    return _predictor
+
+
+def model_info() -> dict:
+    return load_model().info()
+
+
+def analyse(image_bytes: bytes) -> dict:
+    """Full clarus_core result for one image (cached by content hash for the integrated + baseline calls of one request)."""
+    key = hashlib.sha256(image_bytes).hexdigest()
+    with _cache_lock:
+        if key in _cache:
+            _cache.move_to_end(key)
+            return _cache[key]
+    result = load_model().predict(image_bytes)
+    with _cache_lock:
+        _cache[key] = result
+        while len(_cache) > 4:
+            _cache.popitem(last=False)
+    return result
 
 
 def classify_image(image_bytes: bytes, variant: str = "integrated") -> dict:
     """
-    Takes raw image bytes (already passed quality gating) plus which
-    model variant to use, returns the underlying DR severity
-    classification and confidence for that variant.
-
-    variant: "integrated" or "baseline" — see module docstring.
+    -> usable image: {"status", "dr_class", "confidence", "variant", "triage", "referable_probability", "needs_clinician_review",
+                      "gradcam_png_base64" (integrated only), "core_version"}
+       unusable image (no retina found / not an image): {"status": "ungradable_retake" | "invalid_image", "reason": "..."}  (no prediction)
     """
-    if variant == "baseline":
-        weights = [0.7, 0.15, 0.08, 0.05, 0.02]
-    else:
-        weights = [0.5, 0.25, 0.15, 0.07, 0.03]
-
-    predicted_class = random.choices(DR_CLASSES, weights=weights, k=1)[0]
-    confidence = round(random.uniform(0.72, 0.97), 4)
-
-    return {
-        "dr_class": predicted_class,
-        "confidence": confidence,
-        "variant": variant,
-    }
+    r = analyse(image_bytes)
+    if r["status"] not in ("ok", "ok_low_quality"):
+        issues = r.get("quality", {}).get("issues") or []
+        return {"status": r["status"], "reason": issues[0] if issues else ("unreadable_file" if r["status"] == "invalid_image" else "retina_not_detected"),
+                "message": r.get("message"), "variant": variant}
+    block = r["final"] if variant == "integrated" else r.get("baseline", r["final"])
+    out = {"status": r["status"], "dr_class": block["predicted_label"], "confidence": block["confidence"], "variant": variant,
+           "triage": block["triage"], "referable_probability": block["referable_probability"],
+           "needs_clinician_review": bool(r["needs_clinician_review"]) if variant == "integrated" else None, "core_version": r["core_version"]}
+    if variant == "integrated":
+        out["gradcam_png_base64"] = block["explanation"]["overlay_png_base64"]
+    return out

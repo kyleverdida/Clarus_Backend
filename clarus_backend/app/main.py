@@ -14,33 +14,34 @@ Matches the API contract already built into the Flutter app's
 Run locally with:
     uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 """
-
+import base64
+import uuid
 from datetime import date
+from pathlib import Path
 from typing import Literal
 
 from apscheduler.schedulers.background import BackgroundScheduler
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, EmailStr, Field
 
 from app.email_service import GmailAuthError, send_followup_reminder
 from app.quality import check_image_quality
-from app.classifier import classify_image
+from app.classifier import classify_image, load_model, model_info
 from app.triage import map_to_triage
 from app.database import (
-    encounter_is_monitor,
-    get_due_email_reminders,
-    get_follow_up_plans,
-    get_history,
-    init_db,
-    record_reminder_sent,
-    save_encounter,
-    save_follow_up_plan,
-    update_follow_up_plan,
+    encounter_is_monitor, get_due_email_reminders, get_follow_up_plans, get_history,
+    init_db, record_reminder_sent, save_encounter, save_follow_up_plan, update_follow_up_plan,
 )
 
 app = FastAPI(title="Clarus API")
 scheduler = BackgroundScheduler(timezone="Asia/Manila")
+
+GRADCAM_DIR = Path(__file__).resolve().parent.parent / "static" / "gradcam"
+GRADCAM_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/gradcam", StaticFiles(directory=GRADCAM_DIR), name="gradcam")
 
 app.add_middleware(
     CORSMiddleware,
@@ -71,6 +72,7 @@ class FollowUpUpdate(BaseModel):
 @app.on_event("startup")
 def on_startup():
     init_db()
+    load_model()
     scheduler.add_job(
         send_due_reminders,
         "cron",
@@ -94,8 +96,14 @@ def root():
     return {"status": "Clarus API running"}
 
 
+@app.get("/model-info")
+def get_model_info():
+    return model_info()
+
+
 @app.post("/predict")
 async def predict(
+    request: Request,
     image: UploadFile = File(...),
     worker_name: str = Form(default="Unknown"),
     patient_id: str = Form(default="Unknown"),
@@ -117,18 +125,27 @@ async def predict(
             "quality_reason": quality_result["reason"],
         }
 
-    # Runs BOTH variants for the Comparative Evaluation Module (Objective 4):
-    # the "integrated" result is what's shown to the user; "baseline" is
-    # computed and logged purely for later research comparison, never
-    # shown in the app. This keeps the Flutter contract completely
-    # unchanged — no risk of another frontend/backend sync issue.
-    integrated_classification = classify_image(image_bytes, variant="integrated")
-    baseline_classification = classify_image(image_bytes, variant="baseline")
+    integrated_classification = await run_in_threadpool(classify_image, image_bytes, "integrated")
+    if integrated_classification["status"] not in ("ok", "ok_low_quality"):
+        return {
+            "quality_pass": False,
+            "triage": None,
+            "confidence": 0.0,
+            "triage_confidence": None,
+            "severity": None,
+            "severity_confidence": None,
+            "gradcam_url": None,
+            "encounter_id": None,
+            "quality_reason": integrated_classification["reason"],
+        }
+    baseline_classification = await run_in_threadpool(classify_image, image_bytes, "baseline")
 
-    triage = map_to_triage(integrated_classification["dr_class"])
-    baseline_triage = map_to_triage(baseline_classification["dr_class"])
+    triage = integrated_classification.get("triage") or map_to_triage(integrated_classification["dr_class"])
+    baseline_triage = baseline_classification.get("triage") or map_to_triage(baseline_classification["dr_class"])
 
-    gradcam_url = f"https://placehold.co/400x400/{_color_for(triage)}/white/png?text={triage}"
+    gradcam_name = f"{uuid.uuid4().hex}.png"
+    (GRADCAM_DIR / gradcam_name).write_bytes(base64.b64decode(integrated_classification["gradcam_png_base64"]))
+    gradcam_url = f"{str(request.base_url).rstrip('/')}/gradcam/{gradcam_name}"
 
     encounter_id = save_encounter(
         worker_name=worker_name,
@@ -166,6 +183,7 @@ async def predict(
         "severity_confidence": integrated_classification["confidence"],
         "gradcam_url": gradcam_url,
         "encounter_id": encounter_id,
+        "needs_clinician_review": integrated_classification["needs_clinician_review"],
     }
 
 

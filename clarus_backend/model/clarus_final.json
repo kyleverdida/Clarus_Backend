@@ -1,0 +1,107 @@
+{
+  "project": "Clarus",
+  "core_version": "4.3",
+  "recipe": "final-v4",
+  "created": "2026-10-16T15:51:59",
+  "choice": "Ensemble",
+  "members": {
+    "Integrated": "Checkpoint Clarus Integrated/Clarus_Integrated_EfficientNetB0.keras",
+    "Baseline": "Checkpoint ClarusBaseline/Clarus_Baseline_EfficientNetB0.keras"
+  },
+  "temperature": 1.2263461956754318,
+  "refer_threshold": 0.10058481820228796,
+  "target_sensitivity": 0.9,
+  "operating_point": "study",
+  "pipeline": "bgremoval+benGraham-v1",
+  "remove_background": true,
+  "img_size": [
+    256,
+    256
+  ],
+  "tta": true,
+  "quality": {
+    "min_sharpness": 6.1,
+    "brightness": [
+      25,
+      220
+    ],
+    "min_area": 0.25,
+    "max_center_offset": 0.2,
+    "min_red_ratio": 1.1
+  },
+  "triage_mapping": {
+    "No_DR": "Normal",
+    "Mild": "Monitor",
+    "Moderate": "Monitor",
+    "Severe": "Refer",
+    "Proliferative_DR": "Refer"
+  },
+  "integrated_mode": "study",
+  "selection": {
+    "mode": "auto",
+    "criterion": "val_score",
+    "margin": 0.01,
+    "validation": {
+      "Baseline": {
+        "val_score": 0.7603,
+        "balanced_acc": 0.6538,
+        "kappa": 0.8668,
+        "referable_AUC": 0.9334
+      },
+      "Integrated": {
+        "val_score": 0.7518,
+        "balanced_acc": 0.6351,
+        "kappa": 0.8684,
+        "referable_AUC": 0.9328
+      },
+      "Ensemble": {
+        "val_score": 0.7659,
+        "balanced_acc": 0.6591,
+        "kappa": 0.8726,
+        "referable_AUC": 0.9341
+      }
+    }
+  },
+  "disclaimer": "Clinical decision-support output only. Not a diagnosis; confirm with a qualified clinician.",
+  "test_report": {
+    "n_test": 550,
+    "n_referable": 73,
+    "metrics_95ci": {
+      "Accuracy": "0.809 [0.776, 0.842]",
+      "Balanced Accuracy": "0.617 [0.562, 0.668]",
+      "Macro Precision": "0.650 [0.590, 0.707]",
+      "Macro Recall": "0.617 [0.562, 0.668]",
+      "Macro F1": "0.628 [0.571, 0.678]",
+      "Quadratic Kappa": "0.890 [0.861, 0.915]",
+      "Referable Sensitivity": "0.644 [0.534, 0.750]",
+      "Referable Specificity": "0.971 [0.954, 0.985]",
+      "Referable Precision": "0.770 [0.651, 0.875]",
+      "Referable F1": "0.701 [0.603, 0.781]",
+      "Referable False-Negative Rate": "0.356 [0.250, 0.466]",
+      "Referable AUC": "0.964 [0.945, 0.979]",
+      "Referral-Triage Accuracy": "0.902 [0.876, 0.925]"
+    },
+    "operating_points": {
+      "study mapping (arg-max)": {
+        "Sensitivity": 0.6438,
+        "Specificity": 0.9706,
+        "Precision": 0.7705,
+        "False-Negative Rate": 0.3562,
+        "Triage accuracy": 0.9018,
+        "Refer\u2192Normal (dangerous)": 1.0,
+        "Under-triaged": 33.0,
+        "Over-triaged": 21.0
+      },
+      "tuned threshold 0.101": {
+        "Sensitivity": 0.9589,
+        "Specificity": 0.7652,
+        "Precision": 0.3846,
+        "False-Negative Rate": 0.0411,
+        "Triage accuracy": 0.7655,
+        "Refer\u2192Normal (dangerous)": 1.0,
+        "Under-triaged": 10.0,
+        "Over-triaged": 119.0
+      }
+    }
+  }
+}

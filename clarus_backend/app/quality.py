@@ -27,9 +27,11 @@ def check_image_quality(image_bytes: bytes) -> dict:
     Takes raw image bytes, returns a dict describing whether the image
     passes quality gating, plus the specific reason if it fails.
     """
+    if not image_bytes:
+        return {"quality_pass": False, "reason": "unreadable_file"}
+
     np_arr = np.frombuffer(image_bytes, np.uint8)
     img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-
     if img is None:
         return {"quality_pass": False, "reason": "unreadable_file"}
 

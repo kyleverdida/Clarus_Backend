@@ -1,0 +1,24 @@
+{
+  "variant": "Baseline",
+  "focal": false,
+  "aug": false,
+  "integrated_mode": null,
+  "targeted_copies": 0,
+  "focal_gamma": null,
+  "focal_alpha": null,
+  "select_by": "val_score",
+  "stage1": [
+    8,
+    0.001
+  ],
+  "stage2": [
+    30,
+    5e-05
+  ],
+  "fine_tune_from": 100,
+  "dropout": 0.4,
+  "seed": 42,
+  "recipe": "final-v4",
+  "aug_offset": 8.0,
+  "patience": 8
+}

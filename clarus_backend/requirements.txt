@@ -2,7 +2,7 @@ fastapi
 uvicorn[standard]
 APScheduler>=3.10,<4
 python-multipart
-opencv-python-headless
+opencv-python-headless==4.14.0.*
 numpy
 
 google-api-python-client
@@ -10,3 +10,5 @@ google-auth-httplib2
 google-auth-oauthlib
 email-validator
 tzdata
+tensorflow==2.21.0
+Pillow
