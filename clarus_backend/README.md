@@ -1,174 +1,175 @@
 # Clarus Backend
 
-## What this is
-
-FastAPI backend for `Clarus_App`. It implements the screening pipeline:
-image-quality gating → classification → referral-triage mapping → Grad-CAM
-result URL → database logging.
-
-The backend is ready to connect to the Flutter frontend, but the classifier
-and Grad-CAM are still placeholders until the trained model is integrated.
+FastAPI backend for the Clarus Flutter application. It provides authenticated
+diabetic-retinopathy screening, history, follow-up monitoring, referrals,
+clinical notes, analytics, notifications, audit logging, and account
+management.
 
 ## Setup
 
-From this directory (`clarus_backend`):
+From this directory:
 
-```
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
-## Run it
+Configure secrets before starting the API:
 
+```powershell
+$env:CLARUS_AUTH_SECRET = "use-a-long-random-secret"
+$env:CLARUS_BOOTSTRAP_SECRET = "use-a-separate-bootstrap-secret"
 ```
+
+`CLARUS_AUTH_SECRET` signs bearer tokens. `CLARUS_BOOTSTRAP_SECRET` is used
+only when creating the first administrator and should be rotated or removed
+after bootstrap. Never commit either secret.
+
+## Run
+
+```powershell
 python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-FastAPI provides interactive API documentation at
+Interactive API documentation is available at
 `http://localhost:8000/docs`.
 
-## API contract
+## Roles and authorization
 
-### `POST /predict`
+The stable roles are:
 
-Accepts `multipart/form-data` with:
+- `health_worker`
+- `specialist`
+- `ophthalmologist_optometrist`
 
-- `image`: the retinal image file
-- `worker_name`: optional health-worker name; defaults to `Unknown`
-- `patient_id`: patient name entered by the health worker; defaults to `Unknown`
+The BUCAS administrator is one Specialist account with `is_admin = true`.
+There is no separate user-facing Admin role. Only that account can create,
+activate, or deactivate users and view center-wide analytics.
 
-Successful response:
+Health Workers can create screenings and access their own screening and
+follow-up data. Clinical users can access referrals assigned to them. Referral
+creators can also access the referrals they created. The BUCAS Specialist/Admin
+can access all referrals and center-wide analytics.
 
-```json
-{
-	"quality_pass": true,
-	"triage": "Normal",
-	"confidence": 0.91,
-	"triage_confidence": 0.91,
-	"severity": "No_DR",
-	"severity_confidence": 0.91,
-	"gradcam_url": "https://placehold.co/400x400/...",
-	"encounter_id": "a1b2c3d4"
-}
-```
+## Authentication endpoints
 
-The response includes the action triage, the underlying diabetic-retinopathy
-severity, and separate confidence values for each:
+- `POST /auth/bootstrap-admin` creates the first Specialist administrator.
+  Requires the `X-Bootstrap-Secret` header and refuses to run once a user
+  exists.
+- `POST /auth/login` accepts an email and password and returns a bearer token.
+- `GET /auth/me` returns the authenticated user.
+- `GET /auth/users` lists accounts for the administrator.
+- `POST /auth/users` creates Health Worker, Specialist, or
+  Ophthalmologist/Optometrist accounts.
+- `PATCH /auth/users/{user_id}/active` activates or deactivates an account.
 
-If the image fails quality checks, the response is still `200 OK` and has
-`quality_pass: false`, `triage: null`, `confidence: 0.0`,
-`triage_confidence: null`, `severity: null`, `severity_confidence: null`,
-`gradcam_url: null`, `encounter_id: null`, and a `quality_reason` field. The
-rejected image is not saved as an encounter.
-`triage_confidence` describes confidence in the Normal/Monitor/Refer action.
-`severity` and `severity_confidence` describe the underlying DR classifier
-output. The triage mapping is a proposed clinical design and requires review;
-the app must not infer severity from triage alone.
+Passwords are stored as scrypt hashes. Tokens expire and inactive accounts
+cannot authenticate.
 
-### `GET /history`
+## Screening and history endpoints
 
-Returns the user-facing integrated screening history. Baseline comparison
-records are excluded from this response. Each entry includes `patient_id`,
-when it was recorded for the encounter. Records created before patient-name
-capture was added may have a null patient ID.
+- `POST /predict` accepts a retinal image plus `worker_name` and `patient_id`.
+  It requires an authenticated Health Worker or Specialist.
+- `GET /history` returns authorized integrated encounters only.
+- `GET /comparison` returns integrated and baseline records for research and
+  requires administrator access.
+- `GET /model-info` requires authentication.
+- `GET /gradcam/{filename}` serves a Grad-CAM image only to authenticated
+  users and records a view audit event.
 
-### `GET /comparison`
+Accepted images create an integrated encounter for the application and a
+baseline record for research comparison. Rejected images are not saved.
 
-Returns integrated and baseline records for research and evaluation. This is
-not used by `Clarus_App`.
+## Referral workflow
 
-### Follow-up plans
+- `POST /referrals` creates a referral only for an integrated `Refer` encounter,
+  requires patient consent, and assigns it to a Specialist or
+  Ophthalmologist/Optometrist.
+- `GET /referrals` lists referrals authorized for the current user.
+- `GET /referrals/{referral_id}` returns the encounter and clinical notes.
+- `PATCH /referrals/{referral_id}` updates referral status.
+- `GET /referrals/{referral_id}/notes` lists notes.
+- `POST /referrals/{referral_id}/notes` adds a clinical note and optional
+  recommendation.
 
-`POST /follow-ups` creates a consented follow-up plan for a patient. The JSON
-body accepts `patient_id`, optional `encounter_id`, `contact_method` (`Email`),
-`contact_value`, `consent_given`, and a clinician-selected
-`return_date` in `YYYY-MM-DD` format. If an encounter ID is supplied, it must
-belong to an integrated `Monitor` encounter.
+Supported referral statuses are `assigned`, `in_review`, `reviewed`,
+`completed`, and `cancelled`. Referral viewing, creation, note changes, and
+status changes are audit logged.
 
-`GET /follow-ups` returns saved plans for the monitoring list. Use
-`PATCH /follow-ups/{follow_up_id}` to change the `status` (`scheduled`,
-`completed`, `rescheduled`, or `missed`) or update the `return_date`.
+## Follow-ups and reminders
 
-Scheduled plans whose return date has passed are returned with status
-`overdue` automatically. The API rejects new or rescheduled dates in the
-past. Follow-up records include the patient name and can optionally link to
-an integrated Monitor encounter through `encounter_id`.
+- `POST /follow-ups` creates a consented plan.
+- `GET /follow-ups` lists plans available to the authenticated user.
+- `PATCH /follow-ups/{follow_up_id}` changes status or return date.
+- `POST /reminders/send` manually triggers the administrator-only reminder
+  check.
 
-These endpoints persist plans and statuses in SQLite. Email reminders use
-Gmail SMTP and require the following environment variables before starting
-the server:
+Follow-up plans accept `patient_id`, optional `encounter_id`, `contact_method`
+(`Email`), `contact_value`, `consent_given`, and a future `return_date`.
+Gmail reminders require:
 
 ```powershell
 $env:CLARUS_EMAIL_USER = "your-email@gmail.com"
 $env:CLARUS_EMAIL_APP_PASSWORD = "your-gmail-app-password"
 ```
 
-The system checks for reminders once every 24 hours. The first reminder is
-due seven days before the return date, and the second is due on the return
-date if the patient has not returned. To trigger the check manually, use
-`POST /reminders/send`. The response reports the number checked, sent, and
-failed:
+Never commit an email app password.
 
-```json
-{
-	"checked": 1,
-	"sent": 1,
-	"failed": 0
-}
-```
+## Analytics and notifications
 
-For testing, use your own email address and a Gmail App Password. Never
-commit the App Password to the repository.
+- `GET /analytics/summary` returns center-wide triage counts and requires the
+  BUCAS Specialist/Admin.
+- `GET /notifications` lists the current user's in-app notifications.
+- `POST /notifications/{notification_id}/read` marks a notification as read.
 
-### `GET /`
+New referral assignments notify the assigned clinician. Referral status
+changes notify the other workflow participant. Email notifications for
+referrals are not currently enabled.
 
-Returns a simple health response: `{ "status": "Clarus API running" }`.
+## Audit and privacy controls
 
-## What's real vs. stubbed right now
+- `POST /audit/report-share` records a report-sharing event.
+- Referral access and changes are recorded in the audit log.
+- Grad-CAM access is authenticated and audited.
+- Patient consent is required before referrals and follow-up reminders.
+- SQLite stores the application data in `clarus.db`; protect this file and
+  define backup and retention procedures before production use.
+
+Use HTTPS, strong secrets, restricted database access, and a production
+authentication secret outside local development.
+
+## Implementation status
 
 | Component | Status |
 |---|---|
-| Image-quality check (`app/quality.py`) | **Real** — actual OpenCV blur/brightness detection, tested against a deliberately blurred image and correctly rejected it |
-| Classifier (`app/classifier.py`) | **Stubbed** — returns simulated predictions. Replace `classify_image()` with real inference once the trained model exists. Keep the function signature and return shape identical. |
-| Referral-triage mapping (`app/triage.py`) | **Real logic**, but the mapping itself is a proposed design pending clinical review — see the docstring and your own Chapter 1 Limitations |
-| Grad-CAM | **Stubbed** — returns a placeholder image URL; real heatmaps require a trained model |
-| Database (`app/database.py`) | **Real** — SQLite stores integrated and baseline records |
+| Image-quality check | Real OpenCV blur/brightness detection |
+| Classifier | Integrated through `app/classifier.py`; verify the configured model package before production |
+| Triage mapping | Implemented logic; requires clinical validation |
+| Grad-CAM | Generated and served through an authenticated endpoint |
+| Authentication | Bearer tokens, scrypt passwords, role checks, and inactive-account rejection |
+| Database | SQLite with users, encounters, follow-ups, referrals, notes, notifications, and audit logs |
 
-## Connecting `Clarus_App`
+## Connecting the Flutter app
 
-1. Start this backend with `python -m uvicorn app.main:app --host 0.0.0.0 --port 8000`.
-2. In `Clarus_App/lib/services/api_service.dart`, set `useMockApi = false`.
-3. Use `http://10.0.2.2:8000` as the base URL on an Android emulator. Use
-	`http://127.0.0.1:8000` for a Flutter desktop or web client running on the
-	same computer.
-4. Submit the image as the `image` multipart field and the patient name as the
-	`patient_id` multipart field. The response fields match the screening
-	result model used by `Clarus_App`.
+1. Start this backend on port `8000`.
+2. Keep `useMockApi = false` in
+   `Clarus_App/clarus_app/lib/services/api_service.dart`.
+3. Use `http://10.0.2.2:8000` for an Android emulator,
+   `http://127.0.0.1:8000` for desktop/web on the same computer, or the
+   computer's local network IP for a physical device.
+4. Bootstrap the first BUCAS Specialist/Admin, then create the remaining
+   accounts from the admin workflow.
 
-For a physical device, replace the host with the computer's local network IP
-and make sure the device and computer are on the same network.
+## Validation
 
-## Swapping in the real model (hand-off from Person A)
-
-Open `app/classifier.py`. Replace the body of `classify_image()` with real
-model loading + inference. The function must still:
-- Accept raw image bytes
-- Return a dict shaped exactly like `{"dr_class": "...", "confidence": 0.0-1.0}`
-- Use a class name from `DR_CLASSES` that matches your Chapter 3 design
-
-Everything downstream (triage mapping, database, API response) will keep
-working unchanged, because it only depends on that return shape — not on
-how the prediction was made.
-
-## Current verification
-
-```
-Good image   -> 200 OK, quality_pass: true, triage assigned
-Blurry image -> 200 OK, quality_pass: false, reason: "blurry"
-History      -> returns integrated user-facing encounters only
-Patient name -> stored with new encounters and returned by `/history`
-Overdue plan -> scheduled plan past its return date is returned as `overdue`
-Email reminders -> two-stage cadence is tracked with `reminder_count`
+```powershell
+python -m compileall -q app
 ```
 
-The `/comparison` endpoint includes both model variants. Each accepted image
-creates one integrated record for the app and one baseline record for research.
+The Flutter project validates its integration with:
+
+```powershell
+flutter analyze
+flutter test
+```

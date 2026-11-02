@@ -15,15 +15,17 @@ Run locally with:
     uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 """
 import base64
+import hmac
+import os
 import uuid
 from datetime import date
 from pathlib import Path
 from typing import Literal
 
 from apscheduler.schedulers.background import BackgroundScheduler
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, UploadFile, File, Form, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, EmailStr, Field
 
@@ -32,16 +34,25 @@ from app.quality import check_image_quality
 from app.classifier import classify_image, load_model, model_info
 from app.triage import map_to_triage
 from app.database import (
-    encounter_is_monitor, get_due_email_reminders, get_follow_up_plans, get_history,
-    init_db, record_reminder_sent, save_encounter, save_follow_up_plan, update_follow_up_plan,
+    count_users, create_referral, create_referral_note, create_user,
+    encounter_is_monitor, get_due_email_reminders, get_encounter,
+    create_notification, get_follow_up_plans, get_history, get_history_for_user,
+    get_notifications, get_referral, get_referrals_for_user, get_referral_notes,
+    get_user, init_db, list_users, mark_notification_read, record_reminder_sent,
+    save_encounter, save_follow_up_plan, set_user_active, update_follow_up_plan,
+    update_referral_status, write_audit_log,
 )
+from app.auth import (
+    authenticate_user, create_access_token, get_current_user, hash_password,
+    require_admin, require_roles,
+)
+from app.user_model import UserRole
 
 app = FastAPI(title="Clarus API")
 scheduler = BackgroundScheduler(timezone="Asia/Manila")
 
 GRADCAM_DIR = Path(__file__).resolve().parent.parent / "static" / "gradcam"
 GRADCAM_DIR.mkdir(parents=True, exist_ok=True)
-app.mount("/gradcam", StaticFiles(directory=GRADCAM_DIR), name="gradcam")
 
 app.add_middleware(
     CORSMiddleware,
@@ -53,6 +64,9 @@ app.add_middleware(
 
 ContactMethod = Literal["Email"]
 FollowUpStatus = Literal["scheduled", "completed", "rescheduled", "missed"]
+ReferralStatus = Literal[
+    "assigned", "in_review", "reviewed", "completed", "cancelled"
+]
 
 
 class FollowUpCreate(BaseModel):
@@ -67,6 +81,348 @@ class FollowUpCreate(BaseModel):
 class FollowUpUpdate(BaseModel):
     status: FollowUpStatus | None = None
     return_date: date | None = None
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=1)
+
+
+class BootstrapAdminRequest(BaseModel):
+    full_name: str = Field(min_length=1, max_length=120)
+    email: EmailStr
+    password: str = Field(min_length=8)
+
+
+class CreateUserRequest(BaseModel):
+    full_name: str = Field(min_length=1, max_length=120)
+    email: EmailStr
+    password: str = Field(min_length=8)
+    role: UserRole
+
+
+class ReferralCreate(BaseModel):
+    encounter_id: str = Field(min_length=1, max_length=120)
+    assigned_to_user_id: str = Field(min_length=1, max_length=120)
+    consent_given: bool
+
+
+class ReferralStatusUpdate(BaseModel):
+    status: ReferralStatus
+
+
+class ReferralNoteCreate(BaseModel):
+    note: str = Field(min_length=1, max_length=5000)
+    recommendation: str | None = Field(default=None, max_length=5000)
+
+
+class ReportAuditRequest(BaseModel):
+    encounter_id: str = Field(min_length=1, max_length=120)
+    recipient: str | None = Field(default=None, max_length=320)
+
+
+class UserActiveUpdate(BaseModel):
+    is_active: bool
+
+
+@app.post("/auth/bootstrap-admin", status_code=201)
+def bootstrap_admin(
+    request: BootstrapAdminRequest,
+    bootstrap_secret: str | None = Header(default=None, alias="X-Bootstrap-Secret"),
+):
+    configured_secret = os.getenv("CLARUS_BOOTSTRAP_SECRET")
+    if not configured_secret:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="CLARUS_BOOTSTRAP_SECRET is not configured.",
+        )
+    if bootstrap_secret is None or not hmac.compare_digest(
+        bootstrap_secret, configured_secret
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid bootstrap secret.",
+        )
+    if count_users() != 0:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The initial administrator has already been created.",
+        )
+
+    try:
+        user = create_user(
+            full_name=request.full_name,
+            email=str(request.email),
+            password_hash=hash_password(request.password),
+            role="specialist",
+            is_admin=True,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    try:
+        token = create_access_token(user)
+    except RuntimeError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    return {"access_token": token, "token_type": "bearer", "user": user}
+
+
+@app.post("/auth/login")
+def login(request: LoginRequest):
+    user = authenticate_user(str(request.email), request.password)
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    try:
+        token = create_access_token(user)
+    except RuntimeError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    return {"access_token": token, "token_type": "bearer", "user": user}
+
+
+@app.get("/auth/me")
+def current_user(current_user: dict = Depends(get_current_user)):
+    return current_user
+
+
+@app.get("/auth/users")
+def users(current_user: dict = Depends(require_admin)):
+    return list_users()
+
+
+@app.post("/auth/users", status_code=201)
+def create_managed_user(
+    request: CreateUserRequest,
+    current_user: dict = Depends(require_admin),
+):
+    try:
+        user = create_user(
+            full_name=request.full_name,
+            email=str(request.email),
+            password_hash=hash_password(request.password),
+            role=request.role,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return user
+
+
+@app.patch("/auth/users/{user_id}/active")
+def update_managed_user_status(
+    user_id: str,
+    request: UserActiveUpdate,
+    current_user: dict = Depends(require_admin),
+):
+    if user_id == current_user["user_id"] and not request.is_active:
+        raise HTTPException(status_code=422, detail="The active administrator cannot be deactivated.")
+    user = set_user_active(user_id, request.is_active)
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found.")
+    write_audit_log(current_user["user_id"], "user_status_changed", "user", user_id)
+    return user
+
+
+@app.post("/referrals", status_code=201)
+def create_referral_record(
+    request: ReferralCreate,
+    current_user: dict = Depends(
+        require_roles(
+            "health_worker",
+            "specialist",
+            "ophthalmologist_optometrist",
+        )
+    ),
+):
+    if not request.consent_given:
+        raise HTTPException(
+            status_code=422,
+            detail="Patient consent is required before creating a referral.",
+        )
+
+    encounter = get_encounter(request.encounter_id)
+    if encounter is None:
+        raise HTTPException(status_code=404, detail="Encounter not found.")
+    if encounter["triage"] != "Refer":
+        raise HTTPException(
+            status_code=422,
+            detail="Only Refer encounters can be sent to a clinician.",
+        )
+
+    assignee = get_user(request.assigned_to_user_id)
+    if assignee is None or not assignee["is_active"]:
+        raise HTTPException(status_code=404, detail="Assigned user not found.")
+    if assignee["role"] not in (
+        "specialist",
+        "ophthalmologist_optometrist",
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Referrals can only be assigned to clinical users.",
+        )
+
+    try:
+        referral = create_referral(
+            encounter_id=encounter["encounter_id"],
+            patient_id=encounter["patient_id"] or "Unknown",
+            created_by_user_id=current_user["user_id"],
+            assigned_to_user_id=assignee["user_id"],
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    write_audit_log(
+        current_user["user_id"], "referral_created", "referral", referral["referral_id"]
+    )
+    create_notification(
+        assignee["user_id"],
+        "referral_assigned",
+        f"New referral assigned for patient {referral['patient_id']}.",
+        referral["referral_id"],
+    )
+    return referral
+
+
+@app.get("/referrals")
+def referrals(current_user: dict = Depends(get_current_user)):
+    result = get_referrals_for_user(current_user)
+    write_audit_log(current_user["user_id"], "referrals_listed", "referral", None)
+    return result
+
+
+@app.get("/referrals/{referral_id}")
+def referral_detail(
+    referral_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    referral = _get_authorized_referral(referral_id, current_user)
+    write_audit_log(current_user["user_id"], "referral_viewed", "referral", referral_id)
+    return referral
+
+
+@app.patch("/referrals/{referral_id}")
+def update_referral(
+    referral_id: str,
+    request: ReferralStatusUpdate,
+    current_user: dict = Depends(get_current_user),
+):
+    referral = _get_authorized_referral(referral_id, current_user)
+    if (
+        current_user["role"]
+        not in ("specialist", "ophthalmologist_optometrist")
+        and not current_user["is_admin"]
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Only clinical users can update referral status.",
+        )
+    updated = update_referral_status(referral_id, request.status)
+    write_audit_log(
+        current_user["user_id"],
+        "referral_status_changed",
+        "referral",
+        referral_id,
+    )
+    if updated is not None:
+        create_notification(
+            _get_notification_recipient(referral, current_user["user_id"]),
+            "referral_status_changed",
+            f"Referral {referral_id} status changed to {request.status}.",
+            referral_id,
+        )
+    return updated
+
+
+@app.get("/referrals/{referral_id}/notes")
+def referral_notes(
+    referral_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    _get_authorized_referral(referral_id, current_user)
+    write_audit_log(
+        current_user["user_id"], "referral_notes_viewed", "referral", referral_id
+    )
+    return get_referral_notes(referral_id)
+
+
+@app.post("/referrals/{referral_id}/notes", status_code=201)
+def add_referral_note(
+    referral_id: str,
+    request: ReferralNoteCreate,
+    current_user: dict = Depends(get_current_user),
+):
+    _get_authorized_referral(referral_id, current_user)
+    if current_user["role"] not in (
+        "specialist",
+        "ophthalmologist_optometrist",
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Only clinical users can add referral notes.",
+        )
+    note = create_referral_note(
+        referral_id=referral_id,
+        author_user_id=current_user["user_id"],
+        note=request.note.strip(),
+        recommendation=request.recommendation.strip()
+        if request.recommendation
+        else None,
+    )
+    write_audit_log(
+        current_user["user_id"], "referral_note_added", "referral", referral_id
+    )
+    return note
+
+
+def _get_authorized_referral(referral_id: str, current_user: dict) -> dict:
+    referral = get_referral(referral_id)
+    if referral is None:
+        raise HTTPException(status_code=404, detail="Referral not found.")
+    if (
+        not current_user["is_admin"]
+        and referral["assigned_to_user_id"] != current_user["user_id"]
+        and referral["created_by_user_id"] != current_user["user_id"]
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="You do not have access to this referral.",
+        )
+    return referral
+
+
+def _get_notification_recipient(referral: dict, actor_user_id: str) -> str:
+    if referral["created_by_user_id"] != actor_user_id:
+        return referral["created_by_user_id"]
+    return referral["assigned_to_user_id"]
+
+
+@app.get("/notifications")
+def notifications(current_user: dict = Depends(get_current_user)):
+    return get_notifications(current_user["user_id"])
+
+
+@app.post("/notifications/{notification_id}/read")
+def read_notification(
+    notification_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    if not mark_notification_read(notification_id, current_user["user_id"]):
+        raise HTTPException(status_code=404, detail="Notification not found.")
+    return {"ok": True}
+
+
+@app.post("/audit/report-share")
+def audit_report_share(
+    request: ReportAuditRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    write_audit_log(
+        current_user["user_id"],
+        "report_shared",
+        "encounter",
+        request.encounter_id,
+    )
+    return {"ok": True}
 
 
 @app.on_event("startup")
@@ -97,8 +453,20 @@ def root():
 
 
 @app.get("/model-info")
-def get_model_info():
+def get_model_info(current_user: dict = Depends(get_current_user)):
     return model_info()
+
+
+@app.get("/gradcam/{filename}")
+def get_gradcam(
+    filename: str,
+    current_user: dict = Depends(get_current_user),
+):
+    path = (GRADCAM_DIR / filename).resolve()
+    if path.parent != GRADCAM_DIR.resolve() or not path.is_file():
+        raise HTTPException(status_code=404, detail="Visualization not found.")
+    write_audit_log(current_user["user_id"], "gradcam_viewed", "gradcam", filename)
+    return FileResponse(path, media_type="image/png")
 
 
 @app.post("/predict")
@@ -107,6 +475,7 @@ async def predict(
     image: UploadFile = File(...),
     worker_name: str = Form(default="Unknown"),
     patient_id: str = Form(default="Unknown"),
+    current_user: dict = Depends(require_roles("health_worker", "specialist")),
 ):
     image_bytes = await image.read()
 
@@ -159,6 +528,7 @@ async def predict(
         gradcam_url=gradcam_url,
         model_variant="integrated",
         patient_id=patient_id.strip() or "Unknown",
+        created_by_user_id=current_user["user_id"],
     )
     save_encounter(
         worker_name=worker_name,
@@ -172,6 +542,7 @@ async def predict(
         gradcam_url=None,  # baseline has no explainability layer by design
         model_variant="baseline",
         patient_id=patient_id.strip() or "Unknown",
+        created_by_user_id=current_user["user_id"],
     )
 
     return {
@@ -188,14 +559,25 @@ async def predict(
 
 
 @app.get("/history")
-def history():
+def history(current_user: dict = Depends(get_current_user)):
     # Only shows the user-facing "integrated" results — baseline records
     # exist purely for research analysis, not for a health worker to see.
-    return [row for row in get_history() if row.get("model_variant") != "baseline"]
+    return get_history_for_user(current_user)
+
+
+@app.get("/analytics/summary")
+def analytics_summary(current_user: dict = Depends(require_admin)):
+    rows = get_history_for_user(current_user, limit=10000)
+    total = len(rows)
+    counts = {}
+    for row in rows:
+        triage = row.get("triage") or "Unknown"
+        counts[triage] = counts.get(triage, 0) + 1
+    return {"total_screenings": total, "triage_counts": counts}
 
 
 @app.get("/comparison")
-def comparison():
+def comparison(current_user: dict = Depends(require_admin)):
     """
     Research/evaluation endpoint — not called by the Flutter app.
     Returns all records (both variants) for offline analysis, e.g. in a
@@ -205,7 +587,10 @@ def comparison():
 
 
 @app.post("/follow-ups", status_code=201)
-def create_follow_up(plan: FollowUpCreate):
+def create_follow_up(
+    plan: FollowUpCreate,
+    current_user: dict = Depends(get_current_user),
+):
     if not plan.consent_given:
         raise HTTPException(
             status_code=422,
@@ -233,7 +618,7 @@ def create_follow_up(plan: FollowUpCreate):
 
 
 @app.get("/follow-ups")
-def follow_ups():
+def follow_ups(current_user: dict = Depends(get_current_user)):
     return get_follow_up_plans()
 
 
@@ -263,13 +648,17 @@ def send_due_reminders() -> dict:
 
 
 @app.post("/reminders/send")
-def trigger_reminders():
+def trigger_reminders(current_user: dict = Depends(require_admin)):
     """Manually trigger the reminder check for testing and demonstrations."""
     return send_due_reminders()
 
 
 @app.patch("/follow-ups/{follow_up_id}")
-def update_follow_up(follow_up_id: str, plan: FollowUpUpdate):
+def update_follow_up(
+    follow_up_id: str,
+    plan: FollowUpUpdate,
+    current_user: dict = Depends(get_current_user),
+):
     updates = plan.model_dump(exclude_none=True)
     if "return_date" in updates:
         if updates["return_date"] < date.today():
