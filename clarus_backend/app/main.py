@@ -38,6 +38,7 @@ from app.database import (
     count_users, create_referral, create_referral_note, create_user,
     encounter_is_monitor, get_due_email_reminders, get_encounter,
     get_encounter_for_gradcam, get_follow_up_plan_for_user,
+    gradcam_is_authorized,
     create_notification, get_follow_up_plans, get_history, get_history_for_user,
     get_notifications, get_referral, get_referrals_for_user, get_referral_notes,
     get_user, init_db, list_users, mark_notification_read, record_reminder_sent,
@@ -498,17 +499,11 @@ def get_gradcam(
     encounter = get_encounter_for_gradcam(filename)
     if encounter is None:
         raise HTTPException(status_code=404, detail="Visualization not found.")
-    if not current_user["is_admin"]:
-        authorized_history = get_history_for_user(current_user, limit=10000)
-        authorized = (
-            encounter["created_by_user_id"] == current_user["user_id"]
-            or any(
-                row["encounter_id"] == encounter["encounter_id"]
-                for row in authorized_history
-            )
+    if not gradcam_is_authorized(filename, current_user):
+        raise HTTPException(
+            status_code=403,
+            detail="You do not have access to this visualization.",
         )
-        if not authorized:
-            raise HTTPException(status_code=403, detail="You do not have access to this visualization.")
     write_audit_log(current_user["user_id"], "gradcam_viewed", "gradcam", filename)
     return FileResponse(path, media_type="image/png")
 

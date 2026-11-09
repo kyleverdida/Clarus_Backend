@@ -141,6 +141,9 @@ referrals are not currently enabled.
 - SQLite stores application data in `clarus.db`; the database path can be
   overridden with `CLARUS_DB_PATH`. Protect this file and
   define backup and retention procedures before production use.
+  Existing databases created before the foreign-key hardening must be backed up
+  and deleted so the current schema can be recreated; startup fails explicitly
+  instead of silently running without those constraints.
 
 Use HTTPS, strong secrets, restricted database access, and a production
 authentication secret outside local development.

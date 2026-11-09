@@ -37,6 +37,31 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _require_foreign_key_schema(conn: sqlite3.Connection) -> None:
+    required = {
+        "encounters": "created_by_user_id",
+        "follow_up_plans": "encounter_id",
+        "referrals": "encounter_id",
+        "referral_notes": "referral_id",
+        "audit_logs": "user_id",
+        "notifications": "user_id",
+    }
+    missing = [
+        f"{table}.{column}"
+        for table, column in required.items()
+        if not any(
+            row[3] == column
+            for row in conn.execute(f"PRAGMA foreign_key_list({table})")
+        )
+    ]
+    if missing:
+        raise RuntimeError(
+            "The database uses a pre-hardening schema without foreign keys "
+            f"({', '.join(missing)}). Back up and delete the local database "
+            "so it can be recreated with the current schema."
+        )
+
+
 def init_db():
     conn = _connect()
     # WAL lets reads and writes proceed concurrently (persists in the file).
@@ -258,6 +283,7 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_notifications_user
         ON notifications(user_id, read_at, created_at)
     """)
+    _require_foreign_key_schema(conn)
     conn.commit()
     conn.close()
 
@@ -464,6 +490,27 @@ def get_encounter_for_gradcam(filename: str) -> dict | None:
     ).fetchone()
     conn.close()
     return dict(row) if row else None
+
+
+def gradcam_is_authorized(filename: str, user: dict) -> bool:
+    if user["is_admin"]:
+        return get_encounter_for_gradcam(filename) is not None
+    conn = _connect()
+    row = conn.execute(
+        """SELECT 1
+           FROM encounters e
+           LEFT JOIN referrals r ON r.encounter_id = e.encounter_id
+           WHERE e.model_variant = 'integrated'
+             AND e.gradcam_url LIKE ?
+             AND (
+                 e.created_by_user_id = ?
+                 OR r.assigned_to_user_id = ?
+             )
+           LIMIT 1""",
+        (f"%/gradcam/{filename}", user["user_id"], user["user_id"]),
+    ).fetchone()
+    conn.close()
+    return row is not None
 
 
 def get_history_for_user(user: dict, limit: int = 50) -> list[dict]:
@@ -752,8 +799,12 @@ def save_encounter(worker_name: str, quality_result: dict, dr_class: str,
             conn.commit()
             conn.close()
             return encounter_id
-        except sqlite3.IntegrityError:
-            continue
+        except sqlite3.IntegrityError as error:
+            if "encounters.encounter_id" not in str(error).lower():
+                conn.rollback()
+                conn.close()
+                raise
+            conn.rollback()
 
     conn.close()
     raise RuntimeError("Failed to generate a unique encounter_id after 5 attempts")
