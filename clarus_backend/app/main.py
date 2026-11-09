@@ -220,6 +220,16 @@ def users(current_user: dict = Depends(require_admin)):
     return list_users()
 
 
+@app.get("/auth/clinical-users")
+def clinical_users(current_user: dict = Depends(get_current_user)):
+    return [
+        user
+        for user in list_users()
+        if user["is_active"]
+        and user["role"] in ("specialist", "ophthalmologist_optometrist")
+    ]
+
+
 @app.post("/auth/users", status_code=201)
 def create_managed_user(
     request: CreateUserRequest,

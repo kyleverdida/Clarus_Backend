@@ -61,6 +61,8 @@ can access all referrals and center-wide analytics.
 - `POST /auth/login` accepts an email and password and returns a bearer token.
 - `GET /auth/me` returns the authenticated user.
 - Repeated failed login attempts are temporarily throttled.
+- `GET /auth/clinical-users` lists active Specialist and
+  Ophthalmologist/Optometrist accounts for referral assignment.
 - `GET /auth/users` lists accounts for the administrator.
 - `POST /auth/users` creates Health Worker, Specialist, or
   Ophthalmologist/Optometrist accounts.
