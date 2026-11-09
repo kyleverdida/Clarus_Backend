@@ -3,3 +3,4 @@ token.json
 __pycache__/
 *.py[cod]
 clarus.db
+static/gradcam/

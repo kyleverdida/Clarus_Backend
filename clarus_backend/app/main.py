@@ -17,6 +17,7 @@ Run locally with:
 import base64
 import hmac
 import os
+import time
 import uuid
 from datetime import date
 from pathlib import Path
@@ -36,6 +37,7 @@ from app.triage import map_to_triage
 from app.database import (
     count_users, create_referral, create_referral_note, create_user,
     encounter_is_monitor, get_due_email_reminders, get_encounter,
+    get_encounter_for_gradcam, get_follow_up_plan_for_user,
     create_notification, get_follow_up_plans, get_history, get_history_for_user,
     get_notifications, get_referral, get_referrals_for_user, get_referral_notes,
     get_user, init_db, list_users, mark_notification_read, record_reminder_sent,
@@ -50,13 +52,23 @@ from app.user_model import UserRole
 
 app = FastAPI(title="Clarus API")
 scheduler = BackgroundScheduler(timezone="Asia/Manila")
+_failed_logins: dict[str, list[float]] = {}
+_LOGIN_WINDOW_SECONDS = 300
+_LOGIN_ATTEMPT_LIMIT = 5
 
 GRADCAM_DIR = Path(__file__).resolve().parent.parent / "static" / "gradcam"
 GRADCAM_DIR.mkdir(parents=True, exist_ok=True)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        origin.strip()
+        for origin in os.getenv(
+            "CLARUS_CORS_ORIGINS",
+            "http://localhost:3000,http://localhost:8080,http://127.0.0.1:3000",
+        ).split(",")
+        if origin.strip()
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -168,13 +180,28 @@ def bootstrap_admin(
 
 @app.post("/auth/login")
 def login(request: LoginRequest):
+    key = str(request.email).lower()
+    now = time.monotonic()
+    attempts = [
+        timestamp
+        for timestamp in _failed_logins.get(key, [])
+        if now - timestamp < _LOGIN_WINDOW_SECONDS
+    ]
+    if len(attempts) >= _LOGIN_ATTEMPT_LIMIT:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many failed login attempts. Try again later.",
+        )
     user = authenticate_user(str(request.email), request.password)
     if user is None:
+        attempts.append(now)
+        _failed_logins[key] = attempts
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password.",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    _failed_logins.pop(key, None)
     try:
         token = create_access_token(user)
     except RuntimeError as error:
@@ -206,6 +233,9 @@ def create_managed_user(
         )
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
+    write_audit_log(
+        current_user["user_id"], "user_created", "user", user["user_id"]
+    )
     return user
 
 
@@ -465,6 +495,20 @@ def get_gradcam(
     path = (GRADCAM_DIR / filename).resolve()
     if path.parent != GRADCAM_DIR.resolve() or not path.is_file():
         raise HTTPException(status_code=404, detail="Visualization not found.")
+    encounter = get_encounter_for_gradcam(filename)
+    if encounter is None:
+        raise HTTPException(status_code=404, detail="Visualization not found.")
+    if not current_user["is_admin"]:
+        authorized_history = get_history_for_user(current_user, limit=10000)
+        authorized = (
+            encounter["created_by_user_id"] == current_user["user_id"]
+            or any(
+                row["encounter_id"] == encounter["encounter_id"]
+                for row in authorized_history
+            )
+        )
+        if not authorized:
+            raise HTTPException(status_code=403, detail="You do not have access to this visualization.")
     write_audit_log(current_user["user_id"], "gradcam_viewed", "gradcam", filename)
     return FileResponse(path, media_type="image/png")
 
@@ -528,6 +572,8 @@ async def predict(
         gradcam_url=gradcam_url,
         model_variant="integrated",
         patient_id=patient_id.strip() or "Unknown",
+        blur_score=quality_result.get("metrics", {}).get("laplacian_variance"),
+        illumination_score=quality_result.get("metrics", {}).get("mean_brightness"),
         created_by_user_id=current_user["user_id"],
     )
     save_encounter(
@@ -542,6 +588,8 @@ async def predict(
         gradcam_url=None,  # baseline has no explainability layer by design
         model_variant="baseline",
         patient_id=patient_id.strip() or "Unknown",
+        blur_score=quality_result.get("metrics", {}).get("laplacian_variance"),
+        illumination_score=quality_result.get("metrics", {}).get("mean_brightness"),
         created_by_user_id=current_user["user_id"],
     )
 
@@ -614,12 +662,13 @@ def create_follow_up(
         contact_value=plan.contact_value.strip(),
         consent_given=plan.consent_given,
         return_date=plan.return_date.isoformat(),
+        created_by_user_id=current_user["user_id"],
     )
 
 
 @app.get("/follow-ups")
 def follow_ups(current_user: dict = Depends(get_current_user)):
-    return get_follow_up_plans()
+    return get_follow_up_plans(current_user)
 
 
 def send_due_reminders() -> dict:
@@ -659,6 +708,8 @@ def update_follow_up(
     plan: FollowUpUpdate,
     current_user: dict = Depends(get_current_user),
 ):
+    if get_follow_up_plan_for_user(follow_up_id, current_user) is None:
+        raise HTTPException(status_code=404, detail="Follow-up plan not found.")
     updates = plan.model_dump(exclude_none=True)
     if "return_date" in updates:
         if updates["return_date"] < date.today():
@@ -668,7 +719,7 @@ def update_follow_up(
             )
         updates["return_date"] = updates["return_date"].isoformat()
 
-    updated = update_follow_up_plan(follow_up_id, updates)
+    updated = update_follow_up_plan(follow_up_id, updates, current_user)
     if updated is None:
         raise HTTPException(status_code=404, detail="Follow-up plan not found.")
     return updated

@@ -48,7 +48,8 @@ There is no separate user-facing Admin role. Only that account can create,
 activate, or deactivate users and view center-wide analytics.
 
 Health Workers can create screenings and access their own screening and
-follow-up data. Clinical users can access referrals assigned to them. Referral
+follow-up plans. Follow-up plans are visible and editable only by their creator
+or an administrator. Clinical users can access referrals assigned to them. Referral
 creators can also access the referrals they created. The BUCAS Specialist/Admin
 can access all referrals and center-wide analytics.
 
@@ -59,13 +60,15 @@ can access all referrals and center-wide analytics.
   exists.
 - `POST /auth/login` accepts an email and password and returns a bearer token.
 - `GET /auth/me` returns the authenticated user.
+- Repeated failed login attempts are temporarily throttled.
 - `GET /auth/users` lists accounts for the administrator.
 - `POST /auth/users` creates Health Worker, Specialist, or
   Ophthalmologist/Optometrist accounts.
 - `PATCH /auth/users/{user_id}/active` activates or deactivates an account.
 
 Passwords are stored as scrypt hashes. Tokens expire and inactive accounts
-cannot authenticate.
+cannot authenticate. Configure `CLARUS_CORS_ORIGINS` as a comma-separated
+allowlist for browser clients; wildcard origins are not enabled.
 
 ## Screening and history endpoints
 
@@ -75,8 +78,9 @@ cannot authenticate.
 - `GET /comparison` returns integrated and baseline records for research and
   requires administrator access.
 - `GET /model-info` requires authentication.
-- `GET /gradcam/{filename}` serves a Grad-CAM image only to authenticated
-  users and records a view audit event.
+- `GET /gradcam/{filename}` serves a Grad-CAM image only to an authorized
+  encounter owner, assigned clinician, or administrator, and records a view
+  audit event.
 
 Accepted images create an integrated encounter for the application and a
 baseline record for research comparison. Rejected images are not saved.
@@ -100,7 +104,8 @@ status changes are audit logged.
 ## Follow-ups and reminders
 
 - `POST /follow-ups` creates a consented plan.
-- `GET /follow-ups` lists plans available to the authenticated user.
+- `GET /follow-ups` lists plans created by the authenticated user, or all plans
+  for an administrator.
 - `PATCH /follow-ups/{follow_up_id}` changes status or return date.
 - `POST /reminders/send` manually triggers the administrator-only reminder
   check.
@@ -133,7 +138,8 @@ referrals are not currently enabled.
 - Referral access and changes are recorded in the audit log.
 - Grad-CAM access is authenticated and audited.
 - Patient consent is required before referrals and follow-up reminders.
-- SQLite stores the application data in `clarus.db`; protect this file and
+- SQLite stores application data in `clarus.db`; the database path can be
+  overridden with `CLARUS_DB_PATH`. Protect this file and
   define backup and retention procedures before production use.
 
 Use HTTPS, strong secrets, restricted database access, and a production
@@ -148,7 +154,7 @@ authentication secret outside local development.
 | Triage mapping | Implemented logic; requires clinical validation |
 | Grad-CAM | Generated and served through an authenticated endpoint |
 | Authentication | Bearer tokens, scrypt passwords, role checks, and inactive-account rejection |
-| Database | SQLite with users, encounters, follow-ups, referrals, notes, notifications, and audit logs |
+| Database | SQLite with users, encounters, follow-ups, referrals, notes, notifications, and audit logs. Integrated and baseline screening results are rows in `encounters`; Grad-CAM PNGs are files, not database blobs. |
 
 ## Connecting the Flutter app
 
